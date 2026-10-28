@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""lsplain: make Unix permissions easier to understand."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import pwd
+import grp
+import shlex
+import stat
+import sys
+from typing import List, Optional, Sequence, Tuple
+
+VERSION = "0.2.1"
+
+
+def lookup_user(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def lookup_group(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def file_type(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "regular file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symbolic link"
+    if stat.S_ISFIFO(mode):
+        return "FIFO (named pipe)"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "unknown file type"
+
+
+def short_type(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISLNK(mode):
+        return "link"
+    if stat.S_ISFIFO(mode):
+        return "pipe"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "char-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "unknown"
+
+
+def human_size(size: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    unit_index = 0
+    while value >= 1000 and unit_index < len(units) - 1:
+        value /= 1000
+        unit_index += 1
+    if unit_index == 0:
+        return f"{size} B"
+    return f"{value:.1f} {units[unit_index]}"
+
+
+def permission_words(bits: int, is_directory: bool = False) -> str:
+    """Explain rwx bits, accounting for the directory write+execute rule."""
+    actions: List[str] = []
+    readable = bool(bits & 0o4)
+    writable = bool(bits & 0o2)
+    executable = bool(bits & 0o1)
+
+    if is_directory:
+        if readable:
+            actions.append("list names")
+        if writable and executable:
+            actions.append("create, remove or rename entries")
+        elif writable:
+            actions.append("write bit set, but changing entries also needs traverse permission")
+        if executable:
+            actions.append("enter/traverse")
+    else:
+        if readable:
+            actions.append("read")
+        if writable:
+            actions.append("write/change contents")
+        if executable:
+            actions.append("execute/run")
+
+    return ", ".join(actions) if actions else "no rwx permissions"
+
+
+def mode_description(mode: int, is_directory: bool = False, identity_class: Optional[str] = None) -> List[str]:
+    labels = (("Owner", (mode >> 6) & 0o7), ("Group", (mode >> 3) & 0o7), ("Others", mode & 0o7))
+    result: List[str] = []
+    for label, bits in labels:
+        if identity_class == label.lower():
+            label = f"{label} (you)"
+        result.append(f"{label:<12}: {permission_words(bits, is_directory)}")
+    if mode & stat.S_ISUID:
+        result.append("Special      : setuid bit is set; review what this executable does")
+    if mode & stat.S_ISGID:
+        result.append("Special      : setgid bit is set; its effect depends on file type and system")
+    if mode & stat.S_ISVTX:
+        result.append("Special      : sticky bit is set (commonly used on shared directories)")
+    return result
+
+
+def current_user_class(st: os.stat_result) -> Tuple[str, int]:
+    """Return the mode-bit class used for the current effective user."""
+    uid = os.geteuid()
+    gids = set(os.getgroups())
+    gids.add(os.getegid())
+    if uid == st.st_uid:
+        return "owner", (st.st_mode >> 6) & 0o7
+    if st.st_gid in gids:
+        return "group", (st.st_mode >> 3) & 0o7
+    return "others", st.st_mode & 0o7
+
+
+def timestamp_text(timestamp: float) -> str:
+    value = dt.datetime.fromtimestamp(timestamp).astimezone()
+    return value.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+
+
+def display_text(value: str) -> str:
+    """Keep filenames with control characters from breaking the terminal layout."""
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def access_note() -> str:
+    return "Mode bits only; ACLs, macOS privacy controls and other system rules may change actual access."
+
+
+def permission_alerts(st: os.stat_result, rwx_mode: Optional[int] = None) -> List[str]:
+    """Conservative review prompts; these are not a complete security audit.
+
+    If rwx_mode is supplied, check that proposed three-triplet mode instead of
+    the object's current rwx bits (used by the chmod preview).
+    """
+    if stat.S_ISLNK(st.st_mode):
+        return []  # A symlink's own mode bits do not provide useful access guidance.
+    mode = stat.S_IMODE(st.st_mode) if rwx_mode is None else rwx_mode
+    alerts: List[str] = []
+    if mode & 0o002:
+        if stat.S_ISDIR(st.st_mode) and not (mode & 0o001):
+            alerts.append("others have the directory write bit, but lack traverse permission; entry changes may be blocked")
+        elif stat.S_ISDIR(st.st_mode):
+            alerts.append("others may create, remove or rename entries; check whether sharing is intentional")
+        else:
+            alerts.append("others have write permission; check whether sharing is intentional")
+    # Special bits are only known for the current object, not represented by a
+    # three-digit proposed mode.
+    if rwx_mode is None and st.st_mode & stat.S_ISUID:
+        alerts.append("setuid bit is set; review the program and owner")
+    if rwx_mode is None and st.st_mode & stat.S_ISGID and not stat.S_ISDIR(st.st_mode):
+        alerts.append("setgid bit is set; review the program's purpose")
+    return alerts
+
+
+def explain_path(path_text: str, verbose: bool = False) -> int:
+    try:
+        st = os.lstat(path_text)  # Do not silently follow symbolic links.
+    except OSError as exc:
+        print(f"lsplain: cannot inspect {path_text!r}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+
+    kind = file_type(st.st_mode)
+    is_dir = stat.S_ISDIR(st.st_mode)
+    is_link = stat.S_ISLNK(st.st_mode)
+    mode = stat.S_IMODE(st.st_mode)
+    mode_text = stat.filemode(st.st_mode)
+    owner_name = lookup_user(st.st_uid)
+    group_name = lookup_group(st.st_gid)
+    shown_path = display_text(path_text)
+
+    print(shown_path)
+    print(f"  Type / size : {kind} · {human_size(st.st_size)}")
+    print(f"  Owner/group : {owner_name}{' (you)' if st.st_uid == os.geteuid() else ''} / {group_name}")
+    print(f"  Permissions : {mode:04o} ({mode_text})")
+
+    if is_link:
+        try:
+            target = os.readlink(path_text)
+            print(f"  Link target : {display_text(target)}")
+        except OSError as exc:
+            print(f"  Link target : unavailable ({exc.strerror or exc})")
+        print("  Meaning     : this is a symbolic link; access checks normally use its target's permissions.")
+    else:
+        if os.geteuid() == 0:
+            identity_class = None
+        else:
+            try:
+                identity_class, _bits = current_user_class(st)
+            except Exception:
+                identity_class = None
+        for line in mode_description(mode, is_directory=is_dir, identity_class=identity_class):
+            print(f"  {line}")
+        if os.geteuid() == 0:
+            print("  For you     : root may bypass ordinary rwx checks; other system controls can still apply.")
+
+    print(f"  Modified    : {timestamp_text(st.st_mtime)}")
+    alerts = permission_alerts(st)
+    for alert in alerts:
+        # Special bits are already explained explicitly in the permission section.
+        if "setuid bit is set" in alert or "setgid bit is set" in alert:
+            continue
+        print(f"  Review      : {alert}")
+    if verbose:
+        print(f"  UID / GID   : {st.st_uid} / {st.st_gid}")
+        print(f"  Link count  : {st.st_nlink}")
+        print(f"  Inode       : {st.st_ino}")
+        print(f"  Device      : {st.st_dev}")
+        print(f"  Blocks      : {getattr(st, 'st_blocks', 'not available')}")
+        print(f"  Access note : {access_note()}")
+    else:
+        print(f"  Access note : {access_note()}")
+    return 0
+
+
+def explain_contents(path_text: str, include_hidden: bool = False) -> int:
+    try:
+        root_st = os.lstat(path_text)
+        if not stat.S_ISDIR(root_st.st_mode):
+            print(f"lsplain: --contents requires a directory: {path_text!r}", file=sys.stderr)
+            return 2
+        with os.scandir(path_text) as entries:
+            rows = []
+            for entry in entries:
+                if not include_hidden and entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    print(f"lsplain: cannot inspect {entry.path!r}: {exc.strerror or exc}", file=sys.stderr)
+                    return 1
+                rows.append((entry.name, entry.path, st))
+    except OSError as exc:
+        print(f"lsplain: cannot list {path_text!r}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+
+    rows.sort(key=lambda row: (not stat.S_ISDIR(row[2].st_mode), row[0].casefold(), row[0]))
+    print(f"Contents of {display_text(path_text)} ({len(rows)} entr{'y' if len(rows) == 1 else 'ies'})")
+    print("MODE   TYPE       FOR YOU                                  NAME")
+    for name, _full_path, st in rows:
+        is_dir = stat.S_ISDIR(st.st_mode)
+        if stat.S_ISLNK(st.st_mode):
+            mode_label = "link"
+            access = "target permissions apply"
+        else:
+            mode_label = f"{stat.S_IMODE(st.st_mode):04o}"
+            if os.geteuid() == 0:
+                access = "root; other controls may apply"
+            else:
+                identity_class, bits = current_user_class(st)
+                access = f"{identity_class}: {permission_words(bits, is_dir)}"
+        shown_name = display_text(name) + ("/" if is_dir else "")
+        print(f"{mode_label:<6} {short_type(st.st_mode):<10} {access:<40} {shown_name}")
+        for alert in permission_alerts(st):
+            print(f"       ! {alert}: {display_text(name)}")
+    print(f"Access note: {access_note()}")
+    return 0
+
+
+def parse_numeric_mode(mode_text: str) -> int:
+    if len(mode_text) != 3 or any(ch not in "01234567" for ch in mode_text):
+        raise ValueError("MVP supports exactly 3 octal digits (000-777), for example 644, 755 or 000")
+    return int(mode_text, 8)
+
+
+def collect_preview_targets(root_text: str, recursive: bool) -> Tuple[List[Tuple[str, os.stat_result]], List[str]]:
+    """Collect targets without following symlinks; fail rather than give a partial preview."""
+    root_st = os.lstat(root_text)
+    if stat.S_ISLNK(root_st.st_mode):
+        raise ValueError("a symbolic link as the target is not supported by this preview")
+
+    targets: List[Tuple[str, os.stat_result]] = [(root_text, root_st)]
+    skipped_links: List[str] = []
+
+    def visit(directory: str) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name)
+                for entry in ordered:
+                    try:
+                        child_st = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise OSError(exc.errno, f"cannot inspect {entry.path!r}: {exc.strerror}") from exc
+                    if stat.S_ISLNK(child_st.st_mode):
+                        skipped_links.append(entry.path)
+                        continue
+                    targets.append((entry.path, child_st))
+                    if stat.S_ISDIR(child_st.st_mode):
+                        visit(entry.path)
+        except OSError as exc:
+            raise OSError(exc.errno, f"cannot read directory {directory!r}: {exc.strerror}") from exc
+
+    if recursive and stat.S_ISDIR(root_st.st_mode):
+        visit(root_text)
+    return targets, skipped_links
+
+
+def explain_changes(new_mode: int, target_st: os.stat_result) -> List[str]:
+    """Describe added/removed rwx rights by class, without implying full chmod simulation."""
+    old_mode = stat.S_IMODE(target_st.st_mode) & 0o777
+    is_dir = stat.S_ISDIR(target_st.st_mode)
+    class_specs = (("owner", 6), ("group", 3), ("others", 0))
+    bit_specs = ((0o4, "read"), (0o2, "write"), (0o1, "execute"))
+    notes: List[str] = []
+    for label, shift in class_specs:
+        old_bits = (old_mode >> shift) & 0o7
+        new_bits = (new_mode >> shift) & 0o7
+        gain_verb = "gain" if label == "others" else "gains"
+        lose_verb = "lose" if label == "others" else "loses"
+        if is_dir:
+            if not (old_bits & 0o4) and (new_bits & 0o4):
+                notes.append(f"{label} {gain_verb} permission to list names")
+            elif (old_bits & 0o4) and not (new_bits & 0o4):
+                notes.append(f"{label} {lose_verb} permission to list names")
+            if not (old_bits & 0o1) and (new_bits & 0o1):
+                notes.append(f"{label} {gain_verb} enter/traverse permission")
+            elif (old_bits & 0o1) and not (new_bits & 0o1):
+                notes.append(f"{label} {lose_verb} enter/traverse permission")
+            old_can_change_entries = bool(old_bits & 0o2) and bool(old_bits & 0o1)
+            new_can_change_entries = bool(new_bits & 0o2) and bool(new_bits & 0o1)
+            if not old_can_change_entries and new_can_change_entries:
+                notes.append(f"{label} {gain_verb} permission to create, remove or rename entries")
+            elif old_can_change_entries and not new_can_change_entries:
+                notes.append(f"{label} {lose_verb} permission to create, remove or rename entries")
+            elif bool(old_bits & 0o2) != bool(new_bits & 0o2) and not (new_bits & 0o1):
+                notes.append(f"{label} write bit changes, but without traverse permission entry changes may still be blocked")
+        else:
+            gained = [name for bit, name in bit_specs if not (old_bits & bit) and (new_bits & bit)]
+            lost = [name for bit, name in bit_specs if (old_bits & bit) and not (new_bits & bit)]
+            if gained:
+                notes.append(f"{label} {gain_verb} {', '.join(gained)} permission")
+            if lost:
+                notes.append(f"{label} {lose_verb} {', '.join(lost)} permission")
+    return notes
+
+
+def run_chmod_preview(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="lsplain chmod",
+        description="Preview a numeric chmod operation. This command never runs chmod.",
+        epilog="Examples: lsplain chmod 644 notes.txt | lsplain chmod -R 755 ./project",
+    )
+    parser.add_argument("-R", "--recursive", action="store_true", help="preview the change for descendants too")
+    parser.add_argument("mode", help="three-digit octal rwx mode: 000 through 777 (e.g. 644 or 755)")
+    parser.add_argument("path", help="file or directory to preview")
+    args = parser.parse_args(list(argv))
+
+    try:
+        requested_mode = parse_numeric_mode(args.mode)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        targets, skipped_links = collect_preview_targets(args.path, args.recursive)
+    except (OSError, ValueError) as exc:
+        print(f"lsplain: cannot create preview: {exc}", file=sys.stderr)
+        return 1
+
+    command_parts = ["chmod"]
+    if args.recursive:
+        command_parts.append("-R")
+    command_parts.extend((args.mode, args.path))
+    command = shlex.join(command_parts)
+    print("CHMOD PREVIEW — no permissions have been changed")
+    print(f"  Proposed command : {command} (not executed)")
+    print(f"  New rwx mode     : {requested_mode:03o} ({stat.filemode(stat.S_IFREG | requested_mode)})")
+    print(f"  Objects inspected: {len(targets)}")
+    print()
+    print("  STATUS  CURRENT  ->  NEW     PATH")
+    changed = 0
+    special_count = 0
+    for target_path, st in targets:
+        old_mode = stat.S_IMODE(st.st_mode)
+        old_rwx = old_mode & 0o777
+        if old_rwx == requested_mode:
+            status = "SAME"
+        else:
+            status = "CHANGE"
+            changed += 1
+        print(f"  {status:<6}  0{old_rwx:03o}       0{requested_mode:03o}    {display_text(target_path)}")
+        if old_mode & 0o7000:
+            special_count += 1
+            present = []
+            if old_mode & stat.S_ISUID:
+                present.append("setuid")
+            if old_mode & stat.S_ISGID:
+                present.append("setgid")
+            if old_mode & stat.S_ISVTX:
+                present.append("sticky")
+            print(f"           ! existing special bit(s) {', '.join(present)}: effect of real chmod is not predicted")
+        for note in explain_changes(requested_mode, st):
+            print(f"           → {note}")
+        for alert in permission_alerts(st, rwx_mode=requested_mode):
+            print(f"           ! proposed mode: {alert}")
+        # Current special bits are not represented by a three-digit mode.
+        # Warn separately because a real chmod may affect them.
+    print()
+    print(f"Summary: {changed} object(s) would have different rwx bits; {len(targets) - changed} already match.")
+    if args.recursive:
+        print("Recursive note: descendants are inspected without following symbolic links.")
+    if skipped_links:
+        print(f"Skipped {len(skipped_links)} symbolic link(s); their targets were not inspected:")
+        for link_path in skipped_links:
+            print(f"  SKIP  {display_text(link_path)}")
+    if special_count:
+        print("Important: at least one target has setuid/setgid/sticky bits. This preview does not predict those bits' behavior.")
+    print("Scope: predicts the three rwx triplets only; ACLs and other system controls are not simulated.")
+    return 0
+
+
+def build_main_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lsplain",
+        description="Understand file permissions without decoding rwx by hand.",
+        epilog=(
+            "Examples:\n"
+            "  lsplain notes.txt\n"
+            "  lsplain --contents .\n"
+            "  lsplain -v notes.txt\n"
+            "  lsplain chmod 755 notes.txt\n"
+            "  lsplain chmod -R 755 ./project"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"lsplain {VERSION}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show numeric IDs, link count, inode, device and blocks")
+    parser.add_argument("-c", "--contents", action="store_true", help="show a compact, readable listing of a directory's entries")
+    parser.add_argument("-a", "--all", action="store_true", help="with --contents, include hidden entries")
+    parser.add_argument("paths", nargs="+", help="one or more files or directories")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "chmod":
+        return run_chmod_preview(arguments[1:])
+    parser = build_main_parser()
+    args = parser.parse_args(arguments)
+    if args.all and not args.contents:
+        parser.error("--all requires --contents")
+    result = 0
+    for index, path in enumerate(args.paths):
+        if index:
+            print()
+        if args.contents:
+            current = explain_contents(path, include_hidden=args.all)
+        else:
+            current = explain_path(path, verbose=args.verbose)
+        if current != 0:
+            result = current
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())
