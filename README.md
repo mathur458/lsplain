@@ -3,7 +3,7 @@
 > `lsplain` — explains a file's Unix permissions in plain English and previews what a numeric `chmod` would change, without ever changing anything.
 
 **Team:** Deeya Mathur, Ryane Bose
-**Repository:** [TODO: https://github.com/<user>/lsplain]
+**Repository:** [https://github.com/mathur458/lsplain]
 **Date:** 29-10-2026
 
 ---
@@ -272,7 +272,7 @@ lsplain: cannot inspect 'nope.txt': No such file or directory
 ### Installation
 
 ```bash
-git clone [TODO: your repo URL]
+git clone [https://github.com/mathur458/lsplain]
 cd lsplain
 ./install.sh
 ```
