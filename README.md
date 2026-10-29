@@ -3,6 +3,7 @@
 > `lsplain` — explains a file's Unix permissions in plain English and previews what a numeric `chmod` would change, without ever changing anything.
 
 **Team:** Deeya Mathur, Ryane Bose
+
 **Date:** 29-10-2026
 
 ---
