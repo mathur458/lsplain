@@ -56,18 +56,40 @@ We asked 5 classmates. All of them found permission strings hard to interpret an
 
 ### Evidence of trying them
 
+We tested `ch` with a temporary file:
+
 ```bash
+# Create a temporary directory
 tmp=$(mktemp -d)
+
+# Create a test file inside it
 printf 'demo\n' > "$tmp/notes.txt"
+
+# Set the starting permissions to 644
 chmod 644 "$tmp/notes.txt"
+
+# Preview changing the permissions from 644 to 755
 ./target/release/ch --dry-run -vv --mode 755 "$tmp/notes.txt"
+```
+
+**Output:**
+
+```text
+/var/folders/.../notes.txt: mode 0100644 -> 0100755
+```
+
+Then we checked whether the permissions actually changed:
+
+```bash
+# Check the file's current permissions
 ls -l "$tmp/notes.txt"
 ```
 
-```
-/var/folders/.../notes.txt: mode 0100644 -> 0100755
+```text
 -rw-r--r--  1 ...  notes.txt
 ```
+
+The file stayed at `0644`, so `--dry-run` worked. However, `ch` only showed the numeric change; it did not explain in plain English what permissions would change.
 
 `ch` gets the safety right: it previews without applying (the final `ls -l` confirms the file is still `0644`) and reports old and new modes. What is missing, in the output we tested, is any statement of the practical effect — that owner, group and others would all gain execute. The reader still has to decode `0100644 -> 0100755` themselves. This describes the output we observed; it does not claim `ch` has no other features.
 
