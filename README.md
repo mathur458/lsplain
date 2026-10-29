@@ -3,7 +3,6 @@
 > `lsplain` — explains a file's Unix permissions in plain English and previews what a numeric `chmod` would change, without ever changing anything.
 
 **Team:** Deeya Mathur, Ryane Bose
-**Repository:** [https://github.com/mathur458/lsplain]
 **Date:** 29-10-2026
 
 ---
@@ -291,7 +290,14 @@ lsplain: cannot inspect 'nope.txt': No such file or directory
 | 1 | Path could not be inspected (e.g. does not exist) |
 | 2 | Invalid usage or unsupported mode |
 
-### Installation
+### Installation & Requirements
+
+- Python 3.8 or newer
+- macOS or Linux
+- Git, if cloning the repository
+- No third-party Python packages are required
+
+**Platform note:** `lsplain` is designed for Unix-style file permissions and is currently intended for macOS and Linux. Windows is not supported.
 
 ```bash
 git clone [https://github.com/mathur458/lsplain]
@@ -299,18 +305,17 @@ cd lsplain
 ./install.sh
 ```
 
-If `lsplain` is not found, add this to `~/.zshrc` and reload it:
+If `lsplain` is not found after installation, add `~/.local/bin` to your PATH:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 source ~/.zshrc
 ```
 
-Verify, and run the tests (requires Python 3):
+Verify the installation:
 
 ```bash
 lsplain --version
-python3 -m unittest discover -s tests -v   # 12 tests, all pass on our Mac
 ```
 
 ---
